@@ -362,4 +362,4 @@ def get_drug_label(
         raise RuntimeError(f"openFDA drug label lookup failed: {e}") from e
     
 if __name__ == "__main__":
-     mcp.run(transport="stdio")
+     mcp.run(transport="streamable-http")

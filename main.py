@@ -3,7 +3,7 @@ import re
 import logging
 from typing import Annotated
 
-import httpx  # not used yet — you'll need it for search_trials / openFDA next
+import httpx  
 from pydantic import Field
 from Bio import Entrez
 from mcp.server.fastmcp import FastMCP
@@ -19,12 +19,12 @@ mcp = FastMCP(
     port=int(os.getenv("PORT", 10000)),
 )
 
-# --- NCBI config (read from env so you don't commit secrets) ---
-Entrez.email = os.getenv("NCBI_EMAIL", "ajaykathar30@gmail.com")  # required etiquette
+
+Entrez.email = os.getenv("NCBI_EMAIL", "ajaykathar30@gmail.com")  
 Entrez.tool = "medical-mcp"
 _api_key = os.getenv("NCBI_API_KEY", "")
-if _api_key:                       # only set it if you actually have one
-    Entrez.api_key = _api_key      # raises 3 -> 10 requests/sec
+if _api_key:                       
+    Entrez.api_key = _api_key      
 
 
 def _parse(record) -> dict:
@@ -35,7 +35,7 @@ def _parse(record) -> dict:
     pmid = str(citation["PMID"])
     title = str(article.get("ArticleTitle", "")).strip()
 
-    # --- Abstract: may be absent, or split into labeled sections ---
+
     abstract = ""
     abs_node = article.get("Abstract", {}).get("AbstractText")
     if abs_node:
@@ -157,28 +157,18 @@ def _parse_trial(study: dict) -> dict:
 
     nct_id = ident.get("nctId")
     return {
-        "nct_id": nct_id,
-        "title": ident.get("briefTitle"),
-        "status": status.get("overallStatus"),
-        "phases": design.get("phases", []),                       # e.g. ["PHASE3"]
-        "study_type": design.get("studyType"),                    # INTERVENTIONAL / OBSERVATIONAL
-        "enrollment": design.get("enrollmentInfo", {}).get("count"),
-        "conditions": conditions.get("conditions", []),
-        "interventions": [
-            {"type": i.get("type"), "name": i.get("name")}
-            for i in arms.get("interventions", [])
-        ],
-        "lead_sponsor": sponsor.get("leadSponsor", {}).get("name"),
-        "start_date": status.get("startDateStruct", {}).get("date"),
-        "completion_date": status.get("completionDateStruct", {}).get("date"),
-        "summary": desc.get("briefSummary"),
-        "eligibility": elig.get("eligibilityCriteria"),
-        "sex": elig.get("sex"),
-        "min_age": elig.get("minimumAge"),
-        "max_age": elig.get("maximumAge"),
-        "has_results": study.get("hasResults"),
-        "url": f"https://clinicaltrials.gov/study/{nct_id}" if nct_id else None,
-    }
+    "nct_id": nct_id,
+    "title": ident.get("briefTitle"),
+    "status": status.get("overallStatus"),
+    "phases": design.get("phases", []),
+    "conditions": conditions.get("conditions", []),
+    "interventions": [i.get("name") for i in arms.get("interventions", [])],
+    "lead_sponsor": sponsor.get("leadSponsor", {}).get("name"),
+    "enrollment": design.get("enrollmentInfo", {}).get("count"),
+    "completion_date": status.get("completionDateStruct", {}).get("date"),
+    "summary": desc.get("briefSummary"),
+    "url": f"https://clinicaltrials.gov/study/{nct_id}" if nct_id else None,
+}
 
 
 @mcp.tool()
@@ -247,7 +237,129 @@ def search_trials(
         logger.exception("search_trials failed")
         raise RuntimeError(f"ClinicalTrials.gov search failed: {e}") from e
 
+OPENFDA_EVENT = "https://api.fda.gov/drug/event.json"
+_OPENFDA_KEY = os.getenv("OPENFDA_API_KEY", "")  # optional: 40 -> 240 req/min
+
+_FDA_DISCLAIMER = (
+    "FDA adverse event reports are voluntary and do NOT establish that the drug "
+    "caused the reaction. Counts reflect reporting frequency, not true incidence or risk."
+)
+
+
+@mcp.tool()
+def get_adverse_events(
+    drug: Annotated[
+        str,
+        Field(description="Drug name to look up — generic or brand "
+                          "(e.g. 'semaglutide', 'Ozempic')."),
+    ],
+    limit: Annotated[
+        int, Field(description="Number of top reactions to return (1-100).", ge=1, le=100)
+    ] = 25,
+) -> dict:
+    """Get the most frequently reported adverse events (side effects) for a drug.
+
+    Queries the FDA's adverse-event reporting system (FAERS) via openFDA and returns the
+    most commonly reported patient reactions for the given drug, ranked by report count.
+    Use this for drug-safety questions, side-effect profiles, and pharmacovigilance signals.
+
+    IMPORTANT: results are voluntary reports and do not prove causation — present them as
+    "most reported reactions", never as proven side effects or risk rates.
+
+    Returns a dict with: drug, top_reactions (list of {reaction, count}), and a disclaimer.
+    Returns an empty top_reactions list if the drug has no matching reports.
+    """
+    # Match the drug in either the generic or brand name (normalized openfda fields).
+    search = (f'patient.drug.openfda.generic_name:"{drug}"'
+              f' OR patient.drug.openfda.brand_name:"{drug}"')
+    params = {
+        "search": search,
+        # .exact keeps multi-word reactions ("difficulty sleeping") as one phrase
+        # instead of counting each word separately.
+        "count": "patient.reaction.reactionmeddrapt.exact",
+        "limit": max(1, min(limit, 100)),
+    }
+    if _OPENFDA_KEY:
+        params["api_key"] = _OPENFDA_KEY
+
+    try:
+        resp = httpx.get(OPENFDA_EVENT, params=params, timeout=30.0)
+        # openFDA returns 404 (not an error) when zero records match — handle gracefully.
+        if resp.status_code == 404:
+            return {"drug": drug, "top_reactions": [], "disclaimer": _FDA_DISCLAIMER}
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        reactions = [{"reaction": r["term"], "count": r["count"]} for r in results]
+        return {"drug": drug, "top_reactions": reactions, "disclaimer": _FDA_DISCLAIMER}
+    except Exception as e:
+        logger.exception("get_adverse_events failed")
+        raise RuntimeError(f"openFDA adverse event lookup failed: {e}") from e
+    
+
+OPENFDA_LABEL = "https://api.fda.gov/drug/label.json"
+
+
+def _first_section(field, max_len: int = 1500):
+    """Label sections come back as a list of (often very long) strings. Join, trim,
+    and truncate so a single section can't blow up the agent's context."""
+    if not field:
+        return None
+    text = " ".join(field) if isinstance(field, list) else str(field)
+    text = text.strip()
+    return text[:max_len] + ("…" if len(text) > max_len else "") if text else None
+
+
+@mcp.tool()
+def get_drug_label(
+    drug: Annotated[
+        str,
+        Field(description="Drug name — generic or brand (e.g. 'metformin', 'ibuprofen')."),
+    ],
+) -> dict:
+    """Get the official FDA drug label (prescribing information) for a drug.
+
+    Returns the FDA-approved labeling: what the drug is approved to treat, its warnings
+    and boxed warnings, contraindications, dosing, and adverse reactions. Use this for
+    "what is X approved for", safety warnings, dosing, and contraindication questions —
+    i.e. the authoritative approved facts, as opposed to get_adverse_events which gives
+    real-world reported side effects.
+
+    Returns a dict with found=True/False and the key label sections (truncated). Note:
+    labels reflect FDA-approved use only and may not include the most recent changes or
+    off-label uses.
+    """
+    search = f'openfda.generic_name:"{drug}" OR openfda.brand_name:"{drug}"'
+    params = {"search": search, "limit": 1}
+    if _OPENFDA_KEY:
+        params["api_key"] = _OPENFDA_KEY
+
+    try:
+        resp = httpx.get(OPENFDA_LABEL, params=params, timeout=30.0)
+        if resp.status_code == 404:                      # openFDA returns 404 on no match
+            return {"drug": drug, "found": False}
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        if not results:
+            return {"drug": drug, "found": False}
+
+        label = results[0]
+        openfda = label.get("openfda", {})
+        return {
+            "drug": drug,
+            "found": True,
+            "brand_names": openfda.get("brand_name", []),
+            "generic_names": openfda.get("generic_name", []),
+            "manufacturer": openfda.get("manufacturer_name", []),
+            "indications": _first_section(label.get("indications_and_usage")),
+            "boxed_warning": _first_section(label.get("boxed_warning")),
+            "warnings": _first_section(label.get("warnings") or label.get("warnings_and_cautions")),
+            "contraindications": _first_section(label.get("contraindications")),
+            "dosage": _first_section(label.get("dosage_and_administration")),
+            "adverse_reactions": _first_section(label.get("adverse_reactions")),
+        }
+    except Exception as e:
+        logger.exception("get_drug_label failed")
+        raise RuntimeError(f"openFDA drug label lookup failed: {e}") from e
+    
 if __name__ == "__main__":
-    # streamable-http for deployment (Render sets PORT). For local Claude Desktop
-    # testing instead, use: mcp.run(transport="stdio")
-    mcp.run(transport="streamable-http")
+     mcp.run(transport="stdio")

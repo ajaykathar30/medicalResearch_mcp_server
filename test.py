@@ -136,4 +136,4 @@ def search_literature(
 if __name__ == "__main__":
     # streamable-http for deployment (Render sets PORT). For local Claude Desktop
     # testing instead, use: mcp.run(transport="stdio")
-    print(json.dumps(search_literature("GLP-1 agonists for Alzheimer's", 3), indent=2))
+    print(json.dumps(search_literature("GLP-1 agonists for Alzheimer's", 1), indent=2))
